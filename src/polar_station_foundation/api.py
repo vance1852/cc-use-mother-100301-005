@@ -8,13 +8,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .dispatch import DispatchService
+from .dispatch_api import route_dispatch
 from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          dispatch_service: DispatchService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -22,9 +25,19 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
     try:
+        if dispatch_service is not None and parsed.path.startswith("/dispatch"):
+            dispatch_result = route_dispatch(dispatch_service, method, path, body, actor_id)
+            if dispatch_result is not None:
+                return dispatch_result
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
-            return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
+            dispatch_leases = 0
+            if dispatch_service is not None:
+                dispatch_leases = dispatch_service.database.connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_leases WHERE status IN ('held','committed')"
+                ).fetchone()[0]
+            return 200, {"status": "ok", "audit_valid": valid, "audit_events": count,
+                         "active_dispatch_leases": dispatch_leases}
         if method == "POST" and parsed.path == "/organizations":
             receipt = service.register_organization(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
@@ -59,6 +72,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    dispatch_service: DispatchService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +83,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                dispatch_service=self.dispatch_service)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +115,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.dispatch_service = DispatchService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
